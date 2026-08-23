@@ -606,10 +606,9 @@ class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
         joint_names = list(getattr(term, "_joint_names"))
         default_joint_pos = robot.data.default_joint_pos[:, joint_ids].detach().cpu()
         default_joint_vel = robot.data.default_joint_vel[:, joint_ids].detach().cpu()
-        if not torch.equal(default_joint_pos, default_joint_pos[0:1].expand_as(default_joint_pos)):
-            raise RuntimeError("default_joint_pos differs between environments")
-        if not torch.equal(default_joint_vel, default_joint_vel[0:1].expand_as(default_joint_vel)):
-            raise RuntimeError("default_joint_vel differs between environments")
+        nominal_default_joint_pos = getattr(robot.data, "default_joint_pos_nominal", None)
+        if nominal_default_joint_pos is not None:
+            nominal_default_joint_pos = nominal_default_joint_pos[joint_ids].detach().cpu()
 
         clip = getattr(term, "_clip", None)
         motion_keys = getattr(command.motion_lib, "curr_motion_keys", None)
@@ -637,8 +636,19 @@ class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
                 "relative_heading",
             ],
             "joint_names": joint_names,
-            "default_joint_pos": default_joint_pos[0].tolist(),
-            "default_joint_vel": default_joint_vel[0].tolist(),
+            "default_joint_pos": _json_parameter(
+                default_joint_pos, self._env.num_envs, MINIMAL_ACTION_DIM
+            ),
+            "default_joint_vel": _json_parameter(
+                default_joint_vel, self._env.num_envs, MINIMAL_ACTION_DIM
+            ),
+            "nominal_default_joint_pos": (
+                _json_parameter(
+                    nominal_default_joint_pos, self._env.num_envs, MINIMAL_ACTION_DIM
+                )
+                if nominal_default_joint_pos is not None
+                else None
+            ),
             "action_scale": _json_parameter(
                 getattr(term, "_scale", 1.0), self._env.num_envs, MINIMAL_ACTION_DIM
             ),
