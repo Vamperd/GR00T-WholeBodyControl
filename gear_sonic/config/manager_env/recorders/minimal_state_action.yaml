@@ -26,7 +26,10 @@ minimal_outcome:
 minimal_motion:
   _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalMotionRecorderCfg
 
+minimal_context_t:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalContextTRecorderCfg
+
 minimal_metadata:
   _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalMetadataRecorderCfg
-  schema_version: sonic_minimal_sa_v1
+  schema_version: sonic_minimal_sa_v2
   schema_output_path: ???

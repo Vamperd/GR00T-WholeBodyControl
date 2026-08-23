@@ -67,6 +67,19 @@ def _init_variable_frames(
     return per_env_num_frames, frame_choices
 
 
+def _repeated_eval_motion_ids(
+    num_envs: int, repeat: int, device: torch.device | str
+) -> torch.Tensor:
+    """Map consecutive evaluation environments to repeated local motion IDs."""
+    if repeat <= 0 or num_envs % repeat != 0:
+        raise ValueError(f"repeat={repeat} must be positive and divide num_envs={num_envs}")
+    return torch.div(
+        torch.arange(num_envs, device=device),
+        repeat,
+        rounding_mode="floor",
+    )
+
+
 @configclass
 class CommandsCfg:
     """Command specifications for the MDP."""
@@ -320,6 +333,15 @@ class TrackingCommand(CommandTerm):
         self.motion_num_steps = self.motion_lib.get_motion_num_steps(self.motion_ids)
 
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.eval_batch_id = 0
+        self.reset_root_pose_delta = torch.zeros(self.num_envs, 6, device=self.device)
+        self.reset_root_velocity_delta = torch.zeros(self.num_envs, 6, device=self.device)
+        self.reset_joint_pos_delta = torch.zeros(
+            self.num_envs, self.robot_num_dof, device=self.device
+        )
+        self.reset_joint_vel_delta = torch.zeros(
+            self.num_envs, self.robot_num_dof, device=self.device
+        )
 
         # Object position randomization offset (per-env, resampled at reset)
         self._object_position_offset = torch.zeros(self.num_envs, 3, device=self.device)
@@ -2846,10 +2868,28 @@ class TrackingCommand(CommandTerm):
             self.per_env_num_frames[env_ids] = self._frame_choices[idx]
         if len(env_ids) > 0:
             if self.is_evaluating:
-                self.motion_ids[env_ids] = (
-                    torch.arange(self.num_envs).to(self.device)
-                    % self.motion_lib._num_motions  # noqa: SLF001
-                )[env_ids]
+                repeat = int(self.cfg.eval_motion_repeat)
+                if repeat <= 0 or self.num_envs % repeat != 0:
+                    raise ValueError(
+                        f"eval_motion_repeat={repeat} must be positive and divide "
+                        f"num_envs={self.num_envs}"
+                    )
+                expected_motions = self.num_envs // repeat
+                if (
+                    self.cfg.eval_require_full_batch
+                    and self.motion_lib._num_motions != expected_motions  # noqa: SLF001
+                ):
+                    raise ValueError(
+                        f"Evaluation batch loaded {self.motion_lib._num_motions} motions but "
+                        f"{expected_motions} are required for {self.num_envs} envs x "
+                        f"repeat={repeat}"
+                    )
+                repeated_motion_ids = _repeated_eval_motion_ids(
+                    self.num_envs, repeat, self.device
+                )
+                if not self.cfg.eval_require_full_batch:
+                    repeated_motion_ids %= self.motion_lib._num_motions  # noqa: SLF001
+                self.motion_ids[env_ids] = repeated_motion_ids[env_ids]
                 self.motion_start_time_steps[env_ids] = 0
             elif self.cfg.use_paired_motions:
                 self.motion_ids[env_ids] = (
@@ -2991,9 +3031,15 @@ class TrackingCommand(CommandTerm):
 
         self.running_ref_root_height[env_ids] = self.anchor_pos_w[env_ids, 2]
 
+        self.reset_root_pose_delta[env_ids] = 0.0
+        self.reset_root_velocity_delta[env_ids] = 0.0
+        self.reset_joint_pos_delta[env_ids] = 0.0
+        self.reset_joint_vel_delta[env_ids] = 0.0
+
         # Skip reset randomizations during evaluation — they cause visible stumbling
         # at the start of rendered episodes and are only needed for training robustness.
-        if not self.is_evaluating:
+        randomize_reset_state = not self.is_evaluating or self.cfg.randomize_eval_resets
+        if randomize_reset_state:
             range_list = [
                 self.cfg.pose_range.get(key, (0.0, 0.0))
                 for key in ["x", "y", "z", "roll", "pitch", "yaw"]
@@ -3007,6 +3053,7 @@ class TrackingCommand(CommandTerm):
                 rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
             )
             root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
+            self.reset_root_pose_delta[env_ids] = rand_samples
             range_list = [
                 self.cfg.velocity_range.get(key, (0.0, 0.0))
                 for key in ["x", "y", "z", "roll", "pitch", "yaw"]
@@ -3017,6 +3064,7 @@ class TrackingCommand(CommandTerm):
             )
             root_lin_vel[env_ids] += rand_samples[:, :3]
             root_ang_vel[env_ids] += rand_samples[:, 3:]
+            self.reset_root_velocity_delta[env_ids] = rand_samples
 
         # Handle DOF mismatch between motion library and robot
         motion_lib_joint_pos = self.joint_pos.clone()  # Shape: [num_envs, motion_lib_num_dof]
@@ -3038,17 +3086,24 @@ class TrackingCommand(CommandTerm):
             joint_pos = motion_lib_joint_pos
             joint_vel = motion_lib_joint_vel
 
-        if not self.is_evaluating:
-            joint_pos += sample_uniform(
+        joint_pos_before_randomization = joint_pos.clone()
+        if randomize_reset_state:
+            joint_pos_delta = sample_uniform(
                 *self.cfg.joint_position_range, joint_pos.shape, joint_pos.device
             )
-            joint_vel += sample_uniform(
+            joint_vel_delta = sample_uniform(
                 *self.cfg.joint_velocity_range, joint_vel.shape, joint_vel.device
             )
+            joint_pos += joint_pos_delta
+            joint_vel += joint_vel_delta
+            self.reset_joint_vel_delta[env_ids] = joint_vel_delta[env_ids]
 
         soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
         joint_pos[env_ids] = torch.clip(
             joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
+        )
+        self.reset_joint_pos_delta[env_ids] = (
+            joint_pos[env_ids] - joint_pos_before_randomization[env_ids]
         )
 
         ####### Resetting Humaonid States #######
@@ -4130,6 +4185,16 @@ class TrackingCommandCfg(CommandTermCfg):
     # Requires num_envs <= num_available_motions, otherwise will error
     # Useful for replay/evaluation to ensure coverage of all unique motions
     sample_unique_motions: bool = False
+
+    # Evaluation-only collector layout. Consecutive environments repeat the
+    # same loaded motion, e.g. repeat=4 gives [0, 0, 0, 0, 1, 1, 1, 1, ...].
+    eval_motion_repeat: int = 1
+    eval_require_full_batch: bool = False
+    eval_variant_offset: int = 0
+    randomize_eval_resets: bool = False
+    collection_randomization_profile: str = "startup"
+    collection_seed: int = 0
+    collection_motion_manifest: str | None = None
 
     # Sample from the first N frames of the motion (random uniform in [0, N-1])
     # If set, this takes precedence over start_from_first_frame

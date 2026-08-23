@@ -34,6 +34,7 @@ class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
     minimal_state_tp1 = None
     minimal_outcome = None
     minimal_motion = None
+    minimal_context_t = None
     minimal_metadata = None
 
 
@@ -524,6 +525,51 @@ def _json_parameter(value, num_envs: int, width: int, trailing_dim: int | None =
     return {"scope": "per_environment", "values": tensor.tolist()}
 
 
+def _json_runtime_tensor(value, num_envs: int):
+    """Serialize a runtime physics tensor and retain every environment row."""
+    if not isinstance(value, torch.Tensor):
+        return None
+    tensor = value.detach().cpu()
+    if tensor.ndim < 1 or tensor.shape[0] != num_envs:
+        raise RuntimeError(
+            f"Expected runtime tensor with first dimension {num_envs}, found {tensor.shape}"
+        )
+    return {"scope": "per_environment", "values": tensor.tolist()}
+
+
+def _minimal_collection_identity(env) -> dict[str, torch.Tensor]:
+    """Resolve stable motion identity and reset-attempt counters for every env."""
+    command = env.command_manager.get_term("motion")
+    local_motion_ids = command.motion_ids.to(torch.int64)
+    global_motion_ids = command.motion_lib.get_motion_ids_in_dataset(local_motion_ids).to(
+        torch.int64
+    )
+    batch_ids = torch.full_like(global_motion_ids, int(command.eval_batch_id))
+    repeat = int(command.cfg.eval_motion_repeat)
+    variant_offset = int(command.cfg.eval_variant_offset)
+    env_ids = torch.arange(env.num_envs, dtype=torch.int64, device=env.device)
+    variant_ids = torch.remainder(env_ids, repeat) + variant_offset
+
+    if not hasattr(env, "_minimal_attempt_ids"):
+        env._minimal_attempt_ids = torch.zeros_like(global_motion_ids)  # noqa: SLF001
+        env._minimal_identity_motion_ids = torch.full_like(global_motion_ids, -1)  # noqa: SLF001
+        env._minimal_identity_batch_ids = torch.full_like(batch_ids, -1)  # noqa: SLF001
+    identity_changed = (env._minimal_identity_motion_ids != global_motion_ids) | (  # noqa: SLF001
+        env._minimal_identity_batch_ids != batch_ids  # noqa: SLF001
+    )
+    env._minimal_attempt_ids[identity_changed] = 0  # noqa: SLF001
+    env._minimal_identity_motion_ids.copy_(global_motion_ids)  # noqa: SLF001
+    env._minimal_identity_batch_ids.copy_(batch_ids)  # noqa: SLF001
+    return {
+        "env_id": env_ids,
+        "motion_id": local_motion_ids,
+        "global_motion_id": global_motion_ids,
+        "variant_id": variant_ids,
+        "batch_id": batch_ids,
+        "attempt_id": env._minimal_attempt_ids.clone(),  # noqa: SLF001
+    }
+
+
 class MinimalStateTRecorderTerm(recorder_manager.RecorderTerm):
     """Record state ``t`` after action caching and before physics stepping."""
 
@@ -571,25 +617,44 @@ class MinimalOutcomeRecorderTerm(recorder_manager.RecorderTerm):
     """Record terminal boundaries for each transition."""
 
     def record_post_step(self):
-        return "outcome", {
+        termination_manager = self._env.termination_manager
+        termination_terms = {
+            name: termination_manager.get_term(name)
+            for name in ["anchor_pos", "anchor_ori_full", "ee_body_pos", "motion_time_out"]
+            if name in termination_manager.active_terms
+        }
+        outcome = {
             "terminated": self._env.reset_terminated,
             "truncated": self._env.reset_time_outs,
+            "termination_terms": termination_terms,
         }
+        done = self._env.reset_terminated | self._env.reset_time_outs
+        if hasattr(self._env, "_minimal_attempt_ids"):
+            self._env._minimal_attempt_ids[done] += 1  # noqa: SLF001
+        return "outcome", outcome
 
 
 class MinimalMotionRecorderTerm(recorder_manager.RecorderTerm):
     """Record reference indexing needed to audit episode alignment."""
 
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-        self._env_ids = torch.arange(env.num_envs, dtype=torch.int64, device=env.device)
+    def record_pre_step(self):
+        command = self._env.command_manager.get_term("motion")
+        identity = _minimal_collection_identity(self._env)
+        identity["motion_step"] = command.motion_start_time_steps + command.time_steps
+        return "motion", identity
+
+
+class MinimalContextTRecorderTerm(recorder_manager.RecorderTerm):
+    """Record episode-constant reset deltas for state-randomized collection."""
 
     def record_pre_step(self):
         command = self._env.command_manager.get_term("motion")
-        return "motion", {
-            "env_id": self._env_ids,
-            "motion_id": command.motion_ids,
-            "motion_step": command.motion_start_time_steps + command.time_steps,
+        joint_ids = getattr(_action_term(self._env), "_joint_ids")
+        return "context_t", {
+            "reset_root_pose_delta": command.reset_root_pose_delta,
+            "reset_root_velocity_delta": command.reset_root_velocity_delta,
+            "reset_joint_pos_delta": command.reset_joint_pos_delta[:, joint_ids],
+            "reset_joint_vel_delta": command.reset_joint_vel_delta[:, joint_ids],
         }
 
 
@@ -611,9 +676,7 @@ class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
             nominal_default_joint_pos = nominal_default_joint_pos[joint_ids].detach().cpu()
 
         clip = getattr(term, "_clip", None)
-        motion_keys = getattr(command.motion_lib, "curr_motion_keys", None)
-        if motion_keys is None:
-            motion_keys = getattr(command.motion_lib, "_motion_data_keys", [])
+        motion_keys = getattr(command.motion_lib, "_motion_data_keys", [])
         wrapper = getattr(self._env, "wrapper", None)
         wrapper_clip = None
         if wrapper is not None:
@@ -677,6 +740,51 @@ class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
             "motion_id_to_key": {
                 str(index): str(key) for index, key in enumerate(motion_keys)
             },
+            "motion_collection": {
+                "eval_motion_repeat": int(command.cfg.eval_motion_repeat),
+                "eval_require_full_batch": bool(command.cfg.eval_require_full_batch),
+                "variant_offset": int(command.cfg.eval_variant_offset),
+                "randomization_profile": str(command.cfg.collection_randomization_profile),
+                "seed": int(command.cfg.collection_seed),
+                "motion_manifest": command.cfg.collection_motion_manifest,
+                "env_to_variant": [
+                    int(command.cfg.eval_variant_offset)
+                    + env_id % int(command.cfg.eval_motion_repeat)
+                    for env_id in range(self._env.num_envs)
+                ],
+                "env_to_motion_slot": [
+                    env_id // int(command.cfg.eval_motion_repeat)
+                    for env_id in range(self._env.num_envs)
+                ],
+            },
+            "reset_randomization": {
+                "enabled": bool(command.cfg.randomize_eval_resets),
+                "pose_range": {
+                    str(name): list(bounds)
+                    for name, bounds in command.cfg.pose_range.items()
+                },
+                "velocity_range": {
+                    str(name): list(bounds)
+                    for name, bounds in command.cfg.velocity_range.items()
+                },
+                "joint_position_range": list(command.cfg.joint_position_range),
+                "joint_velocity_range": list(command.cfg.joint_velocity_range),
+            },
+            "runtime_physics": {
+                "body_names": list(robot.body_names),
+                "body_com": _json_runtime_tensor(
+                    robot.root_physx_view.get_coms(), self._env.num_envs
+                ),
+                "material_columns": [
+                    "static_friction",
+                    "dynamic_friction",
+                    "restitution",
+                ],
+                "material_properties": _json_runtime_tensor(
+                    robot.root_physx_view.get_material_properties(), self._env.num_envs
+                ),
+            },
+            "termination_terms": list(self._env.termination_manager.active_terms),
         }
         output_path = self.cfg.schema_output_path or f"{file_path}.schema.json"
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -715,7 +823,12 @@ class MinimalMotionRecorderCfg(manager_term_cfg.RecorderTermCfg):
 
 
 @configclass
+class MinimalContextTRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalContextTRecorderTerm
+
+
+@configclass
 class MinimalMetadataRecorderCfg(manager_term_cfg.RecorderTermCfg):
     class_type = MinimalMetadataRecorderTerm
-    schema_version: str = "sonic_minimal_sa_v1"
+    schema_version: str = "sonic_minimal_sa_v2"
     schema_output_path: str | None = None

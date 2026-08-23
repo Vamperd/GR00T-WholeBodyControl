@@ -604,6 +604,9 @@ def main(override_config: omegaconf.OmegaConf):
         max_render_steps = config.get("max_render_steps", 0)
 
         run_once = config.get("run_once", False)
+        run_all_motions_once = config.get("run_all_motions_once", False)
+        if run_all_motions_once and not run_once:
+            raise ValueError("run_all_motions_once=True requires run_once=True")
         envs_completed = torch.zeros(config.num_envs, dtype=torch.bool, device=device)
 
         with torch.no_grad():
@@ -648,10 +651,19 @@ def main(override_config: omegaconf.OmegaConf):
                         else envs_completed | dones
                     )
                     if envs_completed.all():
-                        logger.info("All environments completed one episode. Exiting (run_once=True).")
-                        if hasattr(env, "end_render_results"):
-                            env.end_render_results()
-                        break
+                        if run_all_motions_once and env.has_more_eval_motions():
+                            logger.info("All environments completed the current motion batch.")
+                            obs_dict = env.forward_motion_samples()
+                            if obs_dict is None:
+                                raise RuntimeError("Expected another evaluation motion batch")
+                            envs_completed.zero_()
+                        else:
+                            logger.info(
+                                "All environments completed the requested motion set. Exiting."
+                            )
+                            if hasattr(env, "end_render_results"):
+                                env.end_render_results()
+                            break
 
                 for obs_key in obs_dict.keys():  # noqa: SIM118
                     obs_dict[obs_key] = obs_dict[obs_key].to(device)

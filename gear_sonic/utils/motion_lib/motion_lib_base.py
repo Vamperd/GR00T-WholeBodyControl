@@ -373,9 +373,14 @@ class MotionLibBase:
             if self.debug:
                 self._motion_data_load = {}
             else:
+                motion_files = glob.glob(
+                    osp.join(motion_file, "**", "*.pkl"), recursive=True
+                )
+                if self.m_cfg.get("deterministic_motion_order", False):
+                    motion_files.sort()
                 self._motion_data_load = {
                     osp.splitext(osp.basename(f))[0]: {"path": f}
-                    for f in glob.glob(osp.join(motion_file, "**", "*.pkl"), recursive=True)
+                    for f in motion_files
                     if not f.endswith("metadata.pkl")
                 }
 
@@ -978,30 +983,39 @@ class MotionLibBase:
                 )  # noqa: RUF100, T201
         return True
 
-    def load_motions_for_evaluation(self, start_idx=0):
+    def load_motions_for_evaluation(
+        self, start_idx=0, num_motions_to_load=None, require_full_batch=False
+    ):
         # disable this check to avoid upper body poses randomization in evaluation
         # if self.all_motions_loaded:
         #     print("All motions already loaded!!! No need to resample.")
         #     return
 
-        if (
-            self._num_unique_motions > self.num_envs
-        ):  # if number of motions is more than number of envs, then we should only partially load the motions.
-            self.all_motions_loaded = False
-            self.load_motions(
-                random_sample=False,
-                num_motions_to_load=self.num_envs,
-                start_idx=start_idx,
-                is_evaluation=True,
+        if start_idx < 0 or start_idx >= self._num_unique_motions:
+            raise IndexError(
+                f"Evaluation motion start index {start_idx} is outside "
+                f"[0, {self._num_unique_motions})"
             )
+        requested = self.num_envs if num_motions_to_load is None else int(num_motions_to_load)
+        if requested <= 0:
+            raise ValueError(f"num_motions_to_load must be positive, found {requested}")
+        remaining = self._num_unique_motions - start_idx
+        if require_full_batch and remaining < requested:
+            raise ValueError(
+                f"Evaluation requires a full batch of {requested} motions, only {remaining} remain"
+            )
+        if require_full_batch or self._num_unique_motions > requested:
+            actual = requested
         else:
-            self.all_motions_loaded = True
-            self.load_motions(
-                random_sample=False,
-                num_motions_to_load=self._num_unique_motions,
-                start_idx=start_idx,
-                is_evaluation=True,
-            )
+            actual = self._num_unique_motions
+        self.all_motions_loaded = start_idx == 0 and actual == self._num_unique_motions
+        self.load_motions(
+            random_sample=False,
+            num_motions_to_load=actual,
+            start_idx=start_idx,
+            is_evaluation=True,
+        )
+        return actual
 
     def load_motions(
         self,

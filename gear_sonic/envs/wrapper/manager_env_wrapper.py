@@ -1014,18 +1014,43 @@ class ManagerEnvWrapper:
 
     def begin_seq_motion_samples(self, global_rank=0):
         logger.info("Loading motions for evaluation")
-        self.start_idx = global_rank * self.num_envs
-        self._motion_lib.load_motions_for_evaluation(start_idx=self.start_idx)
-        self.reset_all(global_rank=global_rank)
+        repeat = int(getattr(self.motion_command.cfg, "eval_motion_repeat", 1))
+        if repeat <= 0 or self.num_envs % repeat != 0:
+            raise ValueError(
+                f"eval_motion_repeat={repeat} must be positive and divide num_envs={self.num_envs}"
+            )
+        self.eval_motion_batch_size = self.num_envs // repeat
+        self.start_idx = global_rank * self.eval_motion_batch_size
+        self.eval_motions_loaded = self._motion_lib.load_motions_for_evaluation(
+            start_idx=self.start_idx,
+            num_motions_to_load=self.eval_motion_batch_size,
+            require_full_batch=bool(self.motion_command.cfg.eval_require_full_batch),
+        )
+        self.motion_command.eval_batch_id = self.start_idx // self.eval_motion_batch_size
+        return self.reset_all(global_rank=global_rank)
 
     def forward_motion_samples(self, global_rank=0, world_size=1):
         old_start_idx = self.start_idx
-        self.start_idx += world_size * self.num_envs
+        self.start_idx += world_size * self.eval_motion_batch_size
+        if self.start_idx >= self._motion_lib._num_unique_motions:  # noqa: SLF001
+            return None
         logger.info(
             f"Forward motions for evaluation from {old_start_idx} to {self.start_idx} - rank: {global_rank} - world size: {world_size}"  # noqa: E501
         )
-        self._motion_lib.load_motions_for_evaluation(start_idx=self.start_idx)
-        self.reset_all(global_rank=global_rank)
+        self.eval_motions_loaded = self._motion_lib.load_motions_for_evaluation(
+            start_idx=self.start_idx,
+            num_motions_to_load=self.eval_motion_batch_size,
+            require_full_batch=bool(self.motion_command.cfg.eval_require_full_batch),
+        )
+        self.motion_command.eval_batch_id = self.start_idx // self.eval_motion_batch_size
+        return self.reset_all(global_rank=global_rank)
+
+    def has_more_eval_motions(self):
+        """Return whether another sequential evaluation batch remains."""
+        return (
+            self.start_idx + self.eval_motion_batch_size
+            < self._motion_lib._num_unique_motions  # noqa: SLF001
+        )
 
     def focusing_viewer(self):
         if not self.viewer_focused:
