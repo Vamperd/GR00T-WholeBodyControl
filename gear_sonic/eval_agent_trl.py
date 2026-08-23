@@ -657,6 +657,14 @@ def main(override_config: omegaconf.OmegaConf):
                     obs_dict[obs_key] = obs_dict[obs_key].to(device)
 
     if simulator_type == "IsaacSim":
+        # Isaac Sim exits through os._exit(), which bypasses destructors. Close an
+        # active recorder explicitly so completed HDF5 episodes and schema metadata
+        # are durable before the process terminates.
+        base_env = getattr(env, "env", None)
+        recorder = getattr(base_env, "recorder_manager", None)
+        if recorder is not None and recorder.active_terms:
+            recorder.close()
+            logger.info("Closed Isaac Lab recorder before process exit.")
         os._exit(0)
 
 

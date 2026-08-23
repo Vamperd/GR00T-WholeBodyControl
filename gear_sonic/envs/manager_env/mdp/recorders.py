@@ -11,6 +11,7 @@ import cv2
 import imageio
 from isaaclab.managers import manager_term_cfg, recorder_manager
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply, quat_inv
 from loguru import logger
 import numpy as np
 import torch
@@ -27,6 +28,13 @@ class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
     render_envs = None
     running_ref_root_height = None
     trajectory = None
+    minimal_state_t = None
+    minimal_goal_t = None
+    minimal_actions = None
+    minimal_state_tp1 = None
+    minimal_outcome = None
+    minimal_motion = None
+    minimal_metadata = None
 
 
 class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
@@ -391,3 +399,313 @@ class TrajectoryRecorderCfg(manager_term_cfg.RecorderTermCfg):
 
     class_type = TrajectoryRecorderTerm
     save_path: str = None
+
+
+MINIMAL_ACTION_DIM = 29
+
+
+def _action_term(env):
+    """Return the single 29-DoF joint action term used by released SONIC."""
+    term_names = list(env.action_manager.active_terms)
+    if len(term_names) != 1:
+        raise RuntimeError(
+            "Minimal state-action recording requires exactly one action term; "
+            f"found {term_names}"
+        )
+    term = env.action_manager.get_term(term_names[0])
+    if type(term).__name__ != "JointPositionAction":
+        raise RuntimeError(
+            "Minimal state-action recording requires JointPositionAction; "
+            f"found {type(term).__name__}"
+        )
+    if env.action_manager.total_action_dim != MINIMAL_ACTION_DIM:
+        raise RuntimeError(
+            f"Expected a {MINIMAL_ACTION_DIM}-D action, found "
+            f"{env.action_manager.total_action_dim}"
+        )
+    joint_names = list(getattr(term, "_joint_names", []))
+    if len(joint_names) != MINIMAL_ACTION_DIM:
+        raise RuntimeError(
+            f"Expected {MINIMAL_ACTION_DIM} action joint names, found {len(joint_names)}"
+        )
+    return term
+
+
+def _gravity_in_frame(quat_w: torch.Tensor, down_dir: torch.Tensor) -> torch.Tensor:
+    """Express the world down unit vector in the frame represented by ``quat_w``."""
+    if down_dir.ndim == 1:
+        down_dir = down_dir.unsqueeze(0).expand(quat_w.shape[0], -1)
+    return quat_apply(quat_inv(quat_w), down_dir)
+
+
+def _relative_heading_sin_cos(
+    robot_quat_w: torch.Tensor, reference_quat_w: torch.Tensor
+) -> torch.Tensor:
+    """Encode reference yaw relative to robot yaw without an angle discontinuity."""
+
+    def yaw(quat: torch.Tensor) -> torch.Tensor:
+        w, x, y, z = quat.unbind(dim=-1)
+        return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+
+    delta = yaw(reference_quat_w) - yaw(robot_quat_w)
+    return torch.stack((torch.sin(delta), torch.cos(delta)), dim=-1)
+
+
+def _minimal_state(env, previous_action: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Build the current-frame 93-D state in the released policy's coordinates."""
+    term = _action_term(env)
+    robot = env.scene["robot"]
+    command = env.command_manager.get_term("motion")
+    if command.use_ref_motion_root_quat_w_as_anchor or getattr(command, "_offline", False):
+        raise RuntimeError(
+            "Minimal state-action recording requires the simulated robot pelvis orientation"
+        )
+    joint_ids = getattr(term, "_joint_ids")
+    joint_pos = robot.data.joint_pos[:, joint_ids]
+    joint_vel = robot.data.joint_vel[:, joint_ids]
+    default_joint_pos = robot.data.default_joint_pos[:, joint_ids]
+    default_joint_vel = robot.data.default_joint_vel[:, joint_ids]
+    if previous_action.shape[-1] != MINIMAL_ACTION_DIM:
+        raise RuntimeError(
+            f"Expected previous action shape (..., 29), found {previous_action.shape}"
+        )
+    return {
+        "joint_pos": joint_pos - default_joint_pos,
+        "joint_vel": joint_vel - default_joint_vel,
+        "base_ang_vel": robot.data.root_ang_vel_b,
+        "gravity_robot": _gravity_in_frame(command.robot_anchor_quat_w, command.down_dir),
+        "previous_action": previous_action,
+    }
+
+
+def _minimal_goal(env) -> dict[str, torch.Tensor]:
+    """Build the current-frame 63-D goal in state-compatible coordinates."""
+    term = _action_term(env)
+    robot = env.scene["robot"]
+    command = env.command_manager.get_term("motion")
+    joint_ids = getattr(term, "_joint_ids")
+    reference_joint_pos = command.joint_pos[:, joint_ids]
+    reference_joint_vel = command.joint_vel[:, joint_ids]
+    default_joint_pos = robot.data.default_joint_pos[:, joint_ids]
+    default_joint_vel = robot.data.default_joint_vel[:, joint_ids]
+    return {
+        "reference_joint_pos": reference_joint_pos - default_joint_pos,
+        "reference_joint_vel": reference_joint_vel - default_joint_vel,
+        "gravity_reference": _gravity_in_frame(command.anchor_quat_w, command.down_dir),
+        "relative_heading": _relative_heading_sin_cos(
+            command.robot_anchor_quat_w, command.anchor_quat_w
+        ),
+    }
+
+
+def _json_parameter(value, num_envs: int, width: int, trailing_dim: int | None = None):
+    """Serialize a resolved action parameter without hiding per-environment values."""
+    expected_tail = (width,) if trailing_dim is None else (width, trailing_dim)
+    if isinstance(value, (int, float)):
+        scalar_values = torch.full(expected_tail, float(value), dtype=torch.float32)
+        return {"scope": "global", "values": scalar_values.tolist()}
+    if not isinstance(value, torch.Tensor):
+        return None
+    tensor = value.detach().cpu()
+    if tensor.ndim == len(expected_tail):
+        if tuple(tensor.shape) != expected_tail:
+            raise RuntimeError(
+                f"Expected action parameter shape {expected_tail}, found {tensor.shape}"
+            )
+        return {"scope": "global", "values": tensor.tolist()}
+    if tensor.ndim != len(expected_tail) + 1 or tuple(tensor.shape[1:]) != expected_tail:
+        raise RuntimeError(
+            f"Expected action parameter shape ({num_envs}, {expected_tail}), found {tensor.shape}"
+        )
+    if tensor.shape[0] != num_envs:
+        raise RuntimeError(f"Expected {num_envs} action parameter rows, found {tensor.shape[0]}")
+    if torch.equal(tensor, tensor[0:1].expand_as(tensor)):
+        return {"scope": "global", "values": tensor[0].tolist()}
+    return {"scope": "per_environment", "values": tensor.tolist()}
+
+
+class MinimalStateTRecorderTerm(recorder_manager.RecorderTerm):
+    """Record state ``t`` after action caching and before physics stepping."""
+
+    def record_pre_step(self):
+        return "state_t", _minimal_state(self._env, self._env.action_manager.prev_action)
+
+
+class MinimalGoalTRecorderTerm(recorder_manager.RecorderTerm):
+    """Record the current G1 reference goal aligned with state ``t``."""
+
+    def record_pre_step(self):
+        return "goal_t", _minimal_goal(self._env)
+
+
+class MinimalActionsRecorderTerm(recorder_manager.RecorderTerm):
+    """Record the raw 29-D action actually received by Isaac Lab."""
+
+    def record_pre_step(self):
+        action = self._env.action_manager.action
+        term = _action_term(self._env)
+        if not torch.equal(action, term.raw_actions):
+            raise RuntimeError("ActionManager action and joint action term raw_actions differ")
+        expected_processed = action * getattr(term, "_scale", 1.0) + getattr(
+            term, "_offset", 0.0
+        )
+        clip = getattr(term, "_clip", None)
+        if clip is not None:
+            expected_processed = torch.clamp(
+                expected_processed, min=clip[:, :, 0], max=clip[:, :, 1]
+            )
+        if not torch.allclose(expected_processed, term.processed_actions, rtol=1.0e-5, atol=1.0e-6):
+            max_error = torch.max(torch.abs(expected_processed - term.processed_actions)).item()
+            raise RuntimeError(f"Runtime action mapping check failed; max error={max_error}")
+        return "actions", action
+
+
+class MinimalStateTp1RecorderTerm(recorder_manager.RecorderTerm):
+    """Record state ``t+1`` after physics and before automatic reset."""
+
+    def record_post_step(self):
+        return "state_tp1", _minimal_state(self._env, self._env.action_manager.action)
+
+
+class MinimalOutcomeRecorderTerm(recorder_manager.RecorderTerm):
+    """Record terminal boundaries for each transition."""
+
+    def record_post_step(self):
+        return "outcome", {
+            "terminated": self._env.reset_terminated,
+            "truncated": self._env.reset_time_outs,
+        }
+
+
+class MinimalMotionRecorderTerm(recorder_manager.RecorderTerm):
+    """Record reference indexing needed to audit episode alignment."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._env_ids = torch.arange(env.num_envs, dtype=torch.int64, device=env.device)
+
+    def record_pre_step(self):
+        command = self._env.command_manager.get_term("motion")
+        return "motion", {
+            "env_id": self._env_ids,
+            "motion_id": command.motion_ids,
+            "motion_step": command.motion_start_time_steps + command.time_steps,
+        }
+
+
+class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
+    """Write the runtime-resolved state/action schema after the HDF5 stream closes."""
+
+    cfg: MinimalMetadataRecorderCfg
+
+    def close(self, file_path: str):
+        term = _action_term(self._env)
+        robot = self._env.scene["robot"]
+        command = self._env.command_manager.get_term("motion")
+        joint_ids = getattr(term, "_joint_ids")
+        joint_names = list(getattr(term, "_joint_names"))
+        default_joint_pos = robot.data.default_joint_pos[:, joint_ids].detach().cpu()
+        default_joint_vel = robot.data.default_joint_vel[:, joint_ids].detach().cpu()
+        if not torch.equal(default_joint_pos, default_joint_pos[0:1].expand_as(default_joint_pos)):
+            raise RuntimeError("default_joint_pos differs between environments")
+        if not torch.equal(default_joint_vel, default_joint_vel[0:1].expand_as(default_joint_vel)):
+            raise RuntimeError("default_joint_vel differs between environments")
+
+        clip = getattr(term, "_clip", None)
+        motion_keys = getattr(command.motion_lib, "curr_motion_keys", None)
+        if motion_keys is None:
+            motion_keys = getattr(command.motion_lib, "_motion_data_keys", [])
+        wrapper = getattr(self._env, "wrapper", None)
+        wrapper_clip = None
+        if wrapper is not None:
+            wrapper_clip = wrapper.config.get("action_clip_value", None)
+        metadata = {
+            "schema_version": self.cfg.schema_version,
+            "dataset_file": os.path.basename(f"{file_path}.hdf5"),
+            "dimensions": {"state": 93, "goal": 63, "action": 29},
+            "state_field_order": [
+                "joint_pos",
+                "joint_vel",
+                "base_ang_vel",
+                "gravity_robot",
+                "previous_action",
+            ],
+            "goal_field_order": [
+                "reference_joint_pos",
+                "reference_joint_vel",
+                "gravity_reference",
+                "relative_heading",
+            ],
+            "joint_names": joint_names,
+            "default_joint_pos": default_joint_pos[0].tolist(),
+            "default_joint_vel": default_joint_vel[0].tolist(),
+            "action_scale": _json_parameter(
+                getattr(term, "_scale", 1.0), self._env.num_envs, MINIMAL_ACTION_DIM
+            ),
+            "action_offset": _json_parameter(
+                getattr(term, "_offset", 0.0), self._env.num_envs, MINIMAL_ACTION_DIM
+            ),
+            "action_clip": (
+                _json_parameter(clip, self._env.num_envs, MINIMAL_ACTION_DIM, 2)
+                if clip is not None
+                else None
+            ),
+            "wrapper_action_clip": wrapper_clip,
+            "wrapper_action_transform_enabled": bool(
+                wrapper is not None and wrapper.action_transform_module is not None
+            ),
+            "action_term_type": type(term).__name__,
+            "action_mapping": "processed = clip(actions * action_scale + action_offset)",
+            "quaternion_order": "wxyz",
+            "gravity_definition": "world down unit vector expressed in pelvis frame",
+            "relative_heading_definition": (
+                "[sin(yaw_reference-yaw_robot), cos(yaw_reference-yaw_robot)]"
+            ),
+            "sim_dt": self._env.physics_dt,
+            "control_dt": self._env.step_dt,
+            "sample_rate_hz": 1.0 / self._env.step_dt,
+            "motion_id_to_key": {
+                str(index): str(key) for index, key in enumerate(motion_keys)
+            },
+        }
+        output_path = self.cfg.schema_output_path or f"{file_path}.schema.json"
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, indent=2, ensure_ascii=False)
+
+
+@configclass
+class MinimalStateTRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalStateTRecorderTerm
+
+
+@configclass
+class MinimalGoalTRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalGoalTRecorderTerm
+
+
+@configclass
+class MinimalActionsRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalActionsRecorderTerm
+
+
+@configclass
+class MinimalStateTp1RecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalStateTp1RecorderTerm
+
+
+@configclass
+class MinimalOutcomeRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalOutcomeRecorderTerm
+
+
+@configclass
+class MinimalMotionRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalMotionRecorderTerm
+
+
+@configclass
+class MinimalMetadataRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = MinimalMetadataRecorderTerm
+    schema_version: str = "sonic_minimal_sa_v1"
+    schema_output_path: str | None = None

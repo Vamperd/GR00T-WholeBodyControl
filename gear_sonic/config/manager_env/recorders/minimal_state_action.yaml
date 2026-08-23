@@ -1,0 +1,32 @@
+_target_: gear_sonic.envs.manager_env.mdp.recorders.RecordersCfg
+
+# These paths are mandatory runtime overrides. The reproduction runner resolves
+# both inside ~/bly/runs/<run_id>/ before Isaac Sim starts.
+dataset_export_dir_path: ???
+dataset_filename: sonic_minimal_sa
+dataset_export_mode: 1
+export_in_record_pre_reset: true
+export_in_close: false
+
+minimal_state_t:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalStateTRecorderCfg
+
+minimal_goal_t:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalGoalTRecorderCfg
+
+minimal_actions:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalActionsRecorderCfg
+
+minimal_state_tp1:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalStateTp1RecorderCfg
+
+minimal_outcome:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalOutcomeRecorderCfg
+
+minimal_motion:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalMotionRecorderCfg
+
+minimal_metadata:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalMetadataRecorderCfg
+  schema_version: sonic_minimal_sa_v1
+  schema_output_path: ???
