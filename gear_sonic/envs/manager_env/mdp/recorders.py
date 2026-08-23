@@ -403,6 +403,7 @@ class TrajectoryRecorderCfg(manager_term_cfg.RecorderTermCfg):
 
 
 MINIMAL_ACTION_DIM = 29
+MINIMAL_TERMINATION_TERM_ALIASES = {"time_out": "motion_time_out"}
 
 
 def _action_term(env):
@@ -570,6 +571,27 @@ def _minimal_collection_identity(env) -> dict[str, torch.Tensor]:
     }
 
 
+def _minimal_termination_term_mapping(termination_manager) -> dict[str, str]:
+    """Map stable dataset names to every active runtime termination term."""
+    mapping: dict[str, str] = {}
+    for runtime_name in termination_manager.active_terms:
+        output_name = MINIMAL_TERMINATION_TERM_ALIASES.get(runtime_name, runtime_name)
+        if output_name in mapping:
+            raise RuntimeError(
+                f"Termination terms {mapping[output_name]!r} and {runtime_name!r} "
+                f"both map to {output_name!r}"
+            )
+        mapping[output_name] = runtime_name
+    required = {"anchor_pos", "anchor_ori_full", "ee_body_pos", "motion_time_out"}
+    missing = sorted(required - mapping.keys())
+    if missing:
+        raise RuntimeError(
+            f"Minimal recorder is missing required termination terms: {missing}; "
+            f"active runtime terms are {list(termination_manager.active_terms)}"
+        )
+    return mapping
+
+
 class MinimalStateTRecorderTerm(recorder_manager.RecorderTerm):
     """Record state ``t`` after action caching and before physics stepping."""
 
@@ -619,9 +641,10 @@ class MinimalOutcomeRecorderTerm(recorder_manager.RecorderTerm):
     def record_post_step(self):
         termination_manager = self._env.termination_manager
         termination_terms = {
-            name: termination_manager.get_term(name)
-            for name in ["anchor_pos", "anchor_ori_full", "ee_body_pos", "motion_time_out"]
-            if name in termination_manager.active_terms
+            output_name: termination_manager.get_term(runtime_name)
+            for output_name, runtime_name in _minimal_termination_term_mapping(
+                termination_manager
+            ).items()
         }
         outcome = {
             "terminated": self._env.reset_terminated,
@@ -681,6 +704,9 @@ class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
         wrapper_clip = None
         if wrapper is not None:
             wrapper_clip = wrapper.config.get("action_clip_value", None)
+        termination_term_mapping = _minimal_termination_term_mapping(
+            self._env.termination_manager
+        )
         metadata = {
             "schema_version": self.cfg.schema_version,
             "dataset_file": os.path.basename(f"{file_path}.hdf5"),
@@ -785,6 +811,7 @@ class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
                 ),
             },
             "termination_terms": list(self._env.termination_manager.active_terms),
+            "termination_term_mapping": termination_term_mapping,
         }
         output_path = self.cfg.schema_output_path or f"{file_path}.schema.json"
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
