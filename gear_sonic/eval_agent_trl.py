@@ -603,6 +603,32 @@ def main(override_config: omegaconf.OmegaConf):
         step_count = 0
         max_render_steps = config.get("max_render_steps", 0)
 
+        external_action_replay = None
+        external_action_replay_path = config.get("external_action_replay_path", None)
+        if external_action_replay_path:
+            import numpy as np
+
+            replay_path = Path(external_action_replay_path).expanduser().resolve()
+            if not replay_path.is_file():
+                raise FileNotFoundError(f"External Action replay file is missing: {replay_path}")
+            with np.load(replay_path, allow_pickle=False) as replay_values:
+                if "raw_actions" not in replay_values:
+                    raise ValueError("External Action replay must contain raw_actions")
+                replay_actions = np.asarray(replay_values["raw_actions"], dtype=np.float32)
+            expected_shape = (config.num_envs, env.env.action_manager.total_action_dim)
+            if replay_actions.ndim != 3 or tuple(replay_actions.shape[1:]) != expected_shape:
+                raise ValueError(
+                    "External raw_actions must have shape "
+                    f"[T,{expected_shape[0]},{expected_shape[1]}], found {replay_actions.shape}"
+                )
+            if replay_actions.shape[0] == 0 or not np.isfinite(replay_actions).all():
+                raise ValueError("External raw_actions must be non-empty and finite")
+            external_action_replay = torch.from_numpy(replay_actions).to(device=device)
+            logger.info(
+                "Loaded external Action replay: "
+                f"{replay_path} shape={tuple(external_action_replay.shape)}"
+            )
+
         run_once = config.get("run_once", False)
         run_all_motions_once = config.get("run_all_motions_once", False)
         if run_all_motions_once and not run_once:
@@ -611,6 +637,17 @@ def main(override_config: omegaconf.OmegaConf):
 
         with torch.no_grad():
             while True:
+                if (
+                    external_action_replay is not None
+                    and step_count >= external_action_replay.shape[0]
+                ):
+                    logger.info(
+                        "External Action replay exhausted after "
+                        f"{external_action_replay.shape[0]} steps. Exiting."
+                    )
+                    if hasattr(env, "end_render_results"):
+                        env.end_render_results()
+                    break
                 policy_model = model.policy
                 value_model = model.value_model
                 policy_model.init_rollout()
@@ -619,6 +656,11 @@ def main(override_config: omegaconf.OmegaConf):
                 actions = policy_model.rollout(obs_dict=obs_dict)
                 actor_state["actions"] = policy_model.action_mean.detach()
                 actor_state["obs_dict"] = actions["obs_dict"]
+
+                if external_action_replay is not None:
+                    actor_state["actions"] = external_action_replay[step_count].to(
+                        dtype=actor_state["actions"].dtype
+                    )
 
                 step_count += 1
 
