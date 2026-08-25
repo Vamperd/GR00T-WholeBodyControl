@@ -940,14 +940,24 @@ class PhysicsDiagnosticsRecorderTerm(recorder_manager.RecorderTerm):
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
-        self._joint_ids = getattr(_action_term(env), "_joint_ids")
-        self._foot_ids = _physics_foot_ids(env)
-        self._torque_sum = torch.zeros(
-            env.num_envs, MINIMAL_ACTION_DIM, device=env.device
-        )
+        # RecorderManager is constructed before ActionManager in Isaac Lab.
+        # Resolve Action/contact terms lazily on the first actual environment step.
+        self._joint_ids = None
+        self._foot_ids = None
+        self._torque_sum = None
         self._substeps = 0
 
+    def _initialize(self):
+        if self._torque_sum is not None:
+            return
+        self._joint_ids = getattr(_action_term(self._env), "_joint_ids")
+        self._foot_ids = _physics_foot_ids(self._env)
+        self._torque_sum = torch.zeros(
+            self._env.num_envs, MINIMAL_ACTION_DIM, device=self._env.device
+        )
+
     def record_pre_step(self):
+        self._initialize()
         self._torque_sum.zero_()
         self._substeps = 0
         return None, None
