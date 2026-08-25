@@ -383,7 +383,7 @@ class MySceneCfg(InteractiveSceneCfg):
 
         self.contact_forces = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/.*",
-            history_length=3,
+            history_length=int(config.get("contact_history_length", 3)),
             track_air_time=True,
             force_threshold=10.0,
             debug_vis=False,

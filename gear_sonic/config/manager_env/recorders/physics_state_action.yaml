@@ -1,0 +1,36 @@
+_target_: gear_sonic.envs.manager_env.mdp.recorders.RecordersCfg
+
+# Isaac Lab first exports a raw transition stream. The reproduction kit
+# atomically consolidates it into sonic_physics_sa_v3.hdf5 with one [T+1]
+# State sequence and one [T] Action sequence per episode.
+dataset_export_dir_path: ???
+dataset_filename: sonic_physics_sa_raw
+dataset_export_mode: 1
+export_in_record_pre_reset: true
+export_in_close: false
+
+physics_state_t:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.PhysicsStateTRecorderCfg
+
+physics_actions:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.PhysicsActionsRecorderCfg
+
+physics_state_tp1:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.PhysicsStateTp1RecorderCfg
+
+physics_diagnostics:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.PhysicsDiagnosticsRecorderCfg
+
+minimal_outcome:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalOutcomeRecorderCfg
+
+minimal_motion:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalMotionRecorderCfg
+
+minimal_context_t:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.MinimalContextTRecorderCfg
+
+physics_metadata:
+  _target_: gear_sonic.envs.manager_env.mdp.recorders.PhysicsMetadataRecorderCfg
+  schema_version: sonic_physics_sa_raw_v3
+  schema_output_path: ???

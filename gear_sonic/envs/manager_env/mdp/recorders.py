@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pickle
@@ -36,6 +37,11 @@ class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
     minimal_motion = None
     minimal_context_t = None
     minimal_metadata = None
+    physics_state_t = None
+    physics_actions = None
+    physics_state_tp1 = None
+    physics_diagnostics = None
+    physics_metadata = None
 
 
 class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
@@ -819,6 +825,365 @@ class MinimalMetadataRecorderTerm(recorder_manager.RecorderTerm):
             json.dump(metadata, stream, indent=2, ensure_ascii=False)
 
 
+PHYSICS_STATE_DIM = 70
+PHYSICS_CONTACT_THRESHOLD_N = 10.0
+PHYSICS_FOOT_BODY_NAMES = ("left_ankle_roll_link", "right_ankle_roll_link")
+
+
+def _physics_nominal_joint_pos(env, joint_ids) -> torch.Tensor:
+    robot = env.scene["robot"]
+    nominal = getattr(robot.data, "default_joint_pos_nominal", None)
+    if nominal is None:
+        raise RuntimeError(
+            "Physics state-action recording requires default_joint_pos_nominal; "
+            "enable the startup default-joint event"
+        )
+    if nominal.ndim == 1:
+        nominal = nominal[joint_ids].unsqueeze(0).expand(env.num_envs, -1)
+    elif nominal.ndim == 2:
+        nominal = nominal[:, joint_ids]
+    else:
+        raise RuntimeError(f"Unexpected nominal default shape {tuple(nominal.shape)}")
+    if nominal.shape != (env.num_envs, MINIMAL_ACTION_DIM):
+        raise RuntimeError(f"Unexpected nominal default shape {tuple(nominal.shape)}")
+    return nominal
+
+
+def _physics_contact_sensor(env):
+    try:
+        return env.scene["contact_forces"]
+    except KeyError as error:
+        raise RuntimeError("Physics recording requires the contact_forces sensor") from error
+
+
+def _physics_foot_ids(env) -> list[int]:
+    sensor = _physics_contact_sensor(env)
+    ids, names = sensor.find_bodies(list(PHYSICS_FOOT_BODY_NAMES), preserve_order=True)
+    if names != list(PHYSICS_FOOT_BODY_NAMES):
+        raise RuntimeError(f"Could not resolve ordered G1 feet; found {names}")
+    return ids
+
+
+def _physics_state(env) -> dict[str, torch.Tensor]:
+    """Return the canonical 70-D Markov state plus replay-only root/body pose."""
+    term = _action_term(env)
+    robot = env.scene["robot"]
+    command = env.command_manager.get_term("motion")
+    joint_ids = getattr(term, "_joint_ids")
+    nominal = _physics_nominal_joint_pos(env, joint_ids)
+    foot_forces = _physics_contact_sensor(env).data.net_forces_w[:, _physics_foot_ids(env)]
+    foot_contact = torch.linalg.vector_norm(foot_forces, dim=-1) > PHYSICS_CONTACT_THRESHOLD_N
+    base_height = (
+        robot.data.root_pos_w[:, 2:3] - env.scene.env_origins[:, 2:3]
+    )
+    return {
+        "joint_pos_canonical": robot.data.joint_pos[:, joint_ids] - nominal,
+        "joint_vel": robot.data.joint_vel[:, joint_ids],
+        "base_lin_vel_robot": robot.data.root_lin_vel_b,
+        "base_ang_vel_robot": robot.data.root_ang_vel_b,
+        "gravity_robot": _gravity_in_frame(robot.data.root_quat_w, command.down_dir),
+        "base_height": base_height,
+        "foot_contact": foot_contact,
+        "root_pos_w": robot.data.root_pos_w,
+        "root_quat_w": robot.data.root_quat_w,
+        "body_pos_w": robot.data.body_pos_w,
+    }
+
+
+def _processed_from_raw(term, raw_action: torch.Tensor) -> torch.Tensor:
+    processed = raw_action * getattr(term, "_scale", 1.0) + getattr(term, "_offset", 0.0)
+    clip = getattr(term, "_clip", None)
+    if clip is not None:
+        processed = torch.clamp(processed, min=clip[:, :, 0], max=clip[:, :, 1])
+    return processed
+
+
+class PhysicsStateTRecorderTerm(recorder_manager.RecorderTerm):
+    """Record S_t after Action processing and before the first physics substep."""
+
+    def record_pre_step(self):
+        return "physics_state_t", _physics_state(self._env)
+
+
+class PhysicsActionsRecorderTerm(recorder_manager.RecorderTerm):
+    """Record raw, absolute processed, and canonical processed Action_t."""
+
+    def record_pre_step(self):
+        term = _action_term(self._env)
+        raw = self._env.action_manager.action
+        if not torch.equal(raw, term.raw_actions):
+            raise RuntimeError("ActionManager action and joint action term raw_actions differ")
+        expected = _processed_from_raw(term, raw)
+        if not torch.allclose(expected, term.processed_actions, rtol=1.0e-5, atol=1.0e-6):
+            error = torch.max(torch.abs(expected - term.processed_actions)).item()
+            raise RuntimeError(f"Runtime Action mapping failed; max error={error}")
+        joint_ids = getattr(term, "_joint_ids")
+        nominal = _physics_nominal_joint_pos(self._env, joint_ids)
+        initial_processed = _processed_from_raw(term, self._env.action_manager.prev_action)
+        return "physics_action", {
+            "action_target_canonical": term.processed_actions - nominal,
+            "raw_policy_action": raw,
+            "processed_joint_target_abs": term.processed_actions,
+            "initial_processed_target_canonical": initial_processed - nominal,
+        }
+
+
+class PhysicsStateTp1RecorderTerm(recorder_manager.RecorderTerm):
+    """Record S_{t+1} after all physics substeps and before reset."""
+
+    def record_post_step(self):
+        return "physics_state_tp1", _physics_state(self._env)
+
+
+class PhysicsDiagnosticsRecorderTerm(recorder_manager.RecorderTerm):
+    """Aggregate actuator torque and foot impulse over one control interval."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._joint_ids = getattr(_action_term(env), "_joint_ids")
+        self._foot_ids = _physics_foot_ids(env)
+        self._torque_sum = torch.zeros(
+            env.num_envs, MINIMAL_ACTION_DIM, device=env.device
+        )
+        self._substeps = 0
+
+    def record_pre_step(self):
+        self._torque_sum.zero_()
+        self._substeps = 0
+        return None, None
+
+    def record_post_physics_decimation_step(self):
+        robot = self._env.scene["robot"]
+        self._torque_sum += robot.data.applied_torque[:, self._joint_ids]
+        self._substeps += 1
+        return None, None
+
+    def record_post_step(self):
+        decimation = int(self._env.cfg.decimation)
+        if self._substeps != decimation:
+            raise RuntimeError(
+                f"Expected {decimation} diagnostic substeps, observed {self._substeps}"
+            )
+        history = _physics_contact_sensor(self._env).data.net_forces_w_history
+        if history.shape[1] < decimation:
+            raise RuntimeError(
+                f"Contact history {history.shape[1]} is shorter than decimation {decimation}"
+            )
+        impulse_w = history[:, :decimation, self._foot_ids].sum(dim=1) * self._env.physics_dt
+        return "physics_transition", {
+            "applied_joint_torque_mean": self._torque_sum / decimation,
+            "foot_contact_impulse": impulse_w,
+        }
+
+
+def _file_sha256(path: str | None) -> str | None:
+    if not path:
+        return None
+    resolved = os.path.abspath(path)
+    if not os.path.isfile(resolved):
+        return None
+    digest = hashlib.sha256()
+    with open(resolved, "rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _actuator_metadata(robot) -> dict[str, dict]:
+    result = {}
+    for name, actuator in robot.actuators.items():
+        result[str(name)] = {
+            "type": type(actuator).__name__,
+            "joint_names": list(actuator.joint_names),
+            "min_delay": int(getattr(actuator.cfg, "min_delay", 0)),
+            "max_delay": int(getattr(actuator.cfg, "max_delay", 0)),
+        }
+    return result
+
+
+class PhysicsMetadataRecorderTerm(recorder_manager.RecorderTerm):
+    """Write the runtime-resolved raw schema consumed by the v3 consolidator."""
+
+    cfg: PhysicsMetadataRecorderCfg
+
+    def close(self, file_path: str):
+        term = _action_term(self._env)
+        robot = self._env.scene["robot"]
+        command = self._env.command_manager.get_term("motion")
+        joint_ids = getattr(term, "_joint_ids")
+        joint_names = list(getattr(term, "_joint_names"))
+        nominal = _physics_nominal_joint_pos(self._env, joint_ids).detach().cpu()
+        clip = getattr(term, "_clip", None)
+        wrapper = getattr(self._env, "wrapper", None)
+        wrapper_clip = None if wrapper is None else wrapper.config.get("action_clip_value", None)
+        terrain_cfg = getattr(getattr(self._env.cfg, "scene", None), "terrain", None)
+        terrain_material = getattr(terrain_cfg, "physics_material", None)
+        spawn_cfg = getattr(robot.cfg, "spawn", None)
+        asset_path = getattr(spawn_cfg, "asset_path", None)
+        articulation_props = getattr(spawn_cfg, "articulation_props", None)
+        motion_keys = getattr(command.motion_lib, "_motion_data_keys", [])
+        mapping = getattr(self._env.cfg, "isaaclab_to_mujoco_mapping", None)
+        metadata = {
+            "schema_version": self.cfg.schema_version,
+            "raw_dataset_file": os.path.basename(f"{file_path}.hdf5"),
+            "dimensions": {"state": PHYSICS_STATE_DIM, "action": MINIMAL_ACTION_DIM},
+            "state_field_order": [
+                "joint_pos_canonical", "joint_vel", "base_lin_vel_robot",
+                "base_ang_vel_robot", "gravity_robot", "base_height", "foot_contact",
+            ],
+            "state_field_dimensions": [29, 29, 3, 3, 3, 1, 2],
+            "action_field": "action_target_canonical",
+            "joint_names": joint_names,
+            "body_names": list(robot.body_names),
+            "foot_body_names": list(PHYSICS_FOOT_BODY_NAMES),
+            "isaaclab_to_mujoco_mapping": mapping,
+            "nominal_default_joint_pos": _json_parameter(
+                nominal, self._env.num_envs, MINIMAL_ACTION_DIM
+            ),
+            "nominal_default_joint_vel": _json_parameter(
+                robot.data.default_joint_vel[:, joint_ids].detach().cpu(),
+                self._env.num_envs,
+                MINIMAL_ACTION_DIM,
+            ),
+            "action_scale": _json_parameter(
+                getattr(term, "_scale", 1.0), self._env.num_envs, MINIMAL_ACTION_DIM
+            ),
+            "action_offset": _json_parameter(
+                getattr(term, "_offset", 0.0), self._env.num_envs, MINIMAL_ACTION_DIM
+            ),
+            "action_clip": (
+                _json_parameter(clip, self._env.num_envs, MINIMAL_ACTION_DIM, 2)
+                if clip is not None else None
+            ),
+            "wrapper_action_clip": wrapper_clip,
+            "wrapper_action_transform_enabled": bool(
+                wrapper is not None and wrapper.action_transform_module is not None
+            ),
+            "action_term_type": type(term).__name__,
+            "action_mapping": "processed_abs = clip(raw * action_scale + action_offset)",
+            "runtime_joint": {
+                "default_joint_pos": _json_parameter(
+                    robot.data.default_joint_pos[:, joint_ids], self._env.num_envs, MINIMAL_ACTION_DIM
+                ),
+                "position_limits": _json_parameter(
+                    robot.data.joint_pos_limits[:, joint_ids], self._env.num_envs,
+                    MINIMAL_ACTION_DIM, 2,
+                ),
+                "velocity_limits": _json_parameter(
+                    robot.data.joint_vel_limits[:, joint_ids], self._env.num_envs,
+                    MINIMAL_ACTION_DIM,
+                ),
+                "effort_limits": _json_parameter(
+                    robot.data.joint_effort_limits[:, joint_ids], self._env.num_envs,
+                    MINIMAL_ACTION_DIM,
+                ),
+                "stiffness": _json_parameter(
+                    robot.data.joint_stiffness[:, joint_ids], self._env.num_envs,
+                    MINIMAL_ACTION_DIM,
+                ),
+                "damping": _json_parameter(
+                    robot.data.joint_damping[:, joint_ids], self._env.num_envs,
+                    MINIMAL_ACTION_DIM,
+                ),
+                "armature": _json_parameter(
+                    robot.data.joint_armature[:, joint_ids], self._env.num_envs,
+                    MINIMAL_ACTION_DIM,
+                ),
+                "friction": _json_parameter(
+                    robot.data.joint_friction_coeff[:, joint_ids], self._env.num_envs,
+                    MINIMAL_ACTION_DIM,
+                ),
+            },
+            "actuator_groups": _actuator_metadata(robot),
+            "runtime_rigid_body": {
+                "mass": _json_runtime_tensor(robot.root_physx_view.get_masses(), self._env.num_envs),
+                "inertia": _json_runtime_tensor(robot.root_physx_view.get_inertias(), self._env.num_envs),
+                "com": _json_runtime_tensor(robot.root_physx_view.get_coms(), self._env.num_envs),
+                "material_columns": ["static_friction", "dynamic_friction", "restitution"],
+                "material": _json_runtime_tensor(
+                    robot.root_physx_view.get_material_properties(), self._env.num_envs
+                ),
+            },
+            "terrain": {
+                "type": getattr(terrain_cfg, "terrain_type", None),
+                "height_reference": "root_pos_w.z - env_origin.z",
+                "static_friction": getattr(terrain_material, "static_friction", None),
+                "dynamic_friction": getattr(terrain_material, "dynamic_friction", None),
+                "restitution": getattr(terrain_material, "restitution", None),
+                "friction_combine_mode": getattr(terrain_material, "friction_combine_mode", None),
+                "restitution_combine_mode": getattr(
+                    terrain_material, "restitution_combine_mode", None
+                ),
+            },
+            "simulation": {
+                "sim_dt": self._env.physics_dt,
+                "control_dt": self._env.step_dt,
+                "decimation": int(self._env.cfg.decimation),
+                "sample_rate_hz": 1.0 / self._env.step_dt,
+                "gravity_w": list(getattr(self._env.cfg.sim, "gravity", (0.0, 0.0, -9.81))),
+                "solver_position_iteration_count": getattr(
+                    articulation_props, "solver_position_iteration_count", None
+                ),
+                "solver_velocity_iteration_count": getattr(
+                    articulation_props, "solver_velocity_iteration_count", None
+                ),
+            },
+            "asset": {
+                "path": asset_path,
+                "sha256": _file_sha256(asset_path),
+            },
+            "frames": {
+                "quaternion_order": "wxyz",
+                "base_velocity": "pelvis/body",
+                "gravity": "world-down unit vector in pelvis frame",
+                "foot_impulse": "world",
+                "units": "SI, joint angles in rad",
+            },
+            "contact": {
+                "threshold_n": PHYSICS_CONTACT_THRESHOLD_N,
+                "history_length": int(_physics_contact_sensor(self._env).cfg.history_length),
+            },
+            "motion_id_to_key": {
+                str(index): str(key) for index, key in enumerate(motion_keys)
+            },
+            "motion_collection": {
+                "eval_motion_repeat": int(command.cfg.eval_motion_repeat),
+                "eval_require_full_batch": bool(command.cfg.eval_require_full_batch),
+                "variant_offset": int(command.cfg.eval_variant_offset),
+                "randomization_profile": str(command.cfg.collection_randomization_profile),
+                "seed": int(command.cfg.collection_seed),
+                "motion_manifest": command.cfg.collection_motion_manifest,
+                "env_to_variant": [
+                    int(command.cfg.eval_variant_offset)
+                    + env_id % int(command.cfg.eval_motion_repeat)
+                    for env_id in range(self._env.num_envs)
+                ],
+            },
+            "reset_randomization": {
+                "enabled": bool(command.cfg.randomize_eval_resets),
+                "pose_range": {str(name): list(bounds) for name, bounds in command.cfg.pose_range.items()},
+                "velocity_range": {
+                    str(name): list(bounds) for name, bounds in command.cfg.velocity_range.items()
+                },
+                "joint_position_range": list(command.cfg.joint_position_range),
+                "joint_velocity_range": list(command.cfg.joint_velocity_range),
+            },
+            "external_wrench_recording": "sparse; baseline collection forbids random pushes",
+            "active_events": {
+                str(mode): list(names)
+                for mode, names in self._env.event_manager.active_terms.items()
+            },
+            "termination_terms": list(self._env.termination_manager.active_terms),
+            "termination_term_mapping": _minimal_termination_term_mapping(
+                self._env.termination_manager
+            ),
+        }
+        output_path = self.cfg.schema_output_path or f"{file_path}.schema.json"
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, indent=2, ensure_ascii=False)
+
+
 @configclass
 class MinimalStateTRecorderCfg(manager_term_cfg.RecorderTermCfg):
     class_type = MinimalStateTRecorderTerm
@@ -858,4 +1223,31 @@ class MinimalContextTRecorderCfg(manager_term_cfg.RecorderTermCfg):
 class MinimalMetadataRecorderCfg(manager_term_cfg.RecorderTermCfg):
     class_type = MinimalMetadataRecorderTerm
     schema_version: str = "sonic_minimal_sa_v2"
+    schema_output_path: str | None = None
+
+
+@configclass
+class PhysicsStateTRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = PhysicsStateTRecorderTerm
+
+
+@configclass
+class PhysicsActionsRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = PhysicsActionsRecorderTerm
+
+
+@configclass
+class PhysicsStateTp1RecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = PhysicsStateTp1RecorderTerm
+
+
+@configclass
+class PhysicsDiagnosticsRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = PhysicsDiagnosticsRecorderTerm
+
+
+@configclass
+class PhysicsMetadataRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = PhysicsMetadataRecorderTerm
+    schema_version: str = "sonic_physics_sa_raw_v3"
     schema_output_path: str | None = None
