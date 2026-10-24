@@ -2,7 +2,7 @@
 # Frozen SONIC release teacher used by the standalone DAgger trainer.
 
 defaults:
-  - quantizers/fsq@algo.config.teacher_actor.backbone.quantizer
+  - /actor_critic/quantizers/fsq@algo.config.teacher_actor.backbone.quantizer
 
 algo:
   config:

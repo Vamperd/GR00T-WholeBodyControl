@@ -13,6 +13,7 @@ defaults:
   - override /manager_env/events: tracking/level0_4
   - override /manager_env/terminations: tracking/base_adaptive_strict_ori_foot_xyz
   - override /manager_env/rewards: tracking/base_5point_local_feet_acc
+  - _self_
 
 use_manager_env: true
 headless: true
