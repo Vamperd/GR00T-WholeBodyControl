@@ -5,7 +5,7 @@ defaults:
   - /algo: ppo_im_phc
   - /manager_env: base_env
   - /actor_critic: mlp
-  - /actor_critic/universal_token/teacher_release
+  - /teacher: release
   - override /manager_env/observations/tokenizer: unitoken_all_noz
   - override /manager_env/observations/policy: g1_reference_mlp
   - override /manager_env/observations/teacher: teacher_release
