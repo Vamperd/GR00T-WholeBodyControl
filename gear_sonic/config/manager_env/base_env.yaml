@@ -6,6 +6,7 @@ defaults:
   - actions: tracking/base
   - observations/policy: global
   - observations/critic: privileged
+  - observations/teacher:
   - observations/tokenizer:
   - observations/height_map:
   - observations/policy_atm:
