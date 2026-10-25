@@ -387,17 +387,6 @@ def main(config: OmegaConf):
             _resolve=False,
         ).to(device)
 
-        if getattr(config.algo.config, "use_dagger", False):
-            # Get teacher input key from config or default to "teacher"
-            teacher_input_key = config.algo.config.get("teacher_input_key", "teacher")
-            ref_model = custom_instantiate(
-                config.algo.config.teacher_actor,
-                env_config=env.config,
-                algo_config=config.algo.config,
-                module_dim_dict=module_dim_dict,
-                _resolve=False,
-                input_key=teacher_input_key,
-            ).to(device)
         if not getattr(config.algo.config, "distill_only", False):
             value_model = custom_instantiate(
                 config.algo.config.critic,
@@ -457,7 +446,7 @@ def main(config: OmegaConf):
         disc_model=disc_model,
         value_model=value_model,
         ref_model=ref_model,
-        use_ref_model=getattr(config.algo.config, "use_dagger", False),
+        use_ref_model=False,
         train_dataset=None,
         eval_dataset=None,
         callbacks=callbacks,
